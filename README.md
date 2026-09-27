@@ -75,9 +75,18 @@ they survive DHCP address changes.
 - Banners and hostnames come from other devices on the network, so control
   characters (terminal escape sequences) are stripped and lengths capped before
   anything is shown or cached.
-- magicssh remembers each device's SSH host key. If a device later presents a
-  different key it is marked **⚠ key changed**, and connecting needs a second
-  `enter`. `ssh` still verifies the key against `known_hosts` as usual.
+- magicssh remembers each device's SSH host key (and since when). If a device
+  later presents a different key it is marked **⚠ key changed**, and
+  connecting needs a second `enter`.
+- Before connecting, magicssh runs the same `known_hosts` check `ssh` will
+  (using `ssh -G` for your config: known_hosts files, `HostKeyAlias`, port).
+  Hosts that would fail are marked **⚠ known_hosts** after each scan. Pressing
+  `enter` on one explains the likely cause (a stale entry for a reused
+  address, a reinstall, or no history to tell), shows the command that prints
+  the fingerprint on the device, and lets you type `yes` to remove the old
+  entries (`ssh-keygen -R`, backup kept as `.old`). `ssh` then asks you to
+  accept the new key; magicssh never accepts keys for you. Revoked keys are
+  shown but never removed. The check is skipped when run under `sudo`.
 - With `--deep`, only `nmap` runs as root (via `sudo -n`, after asking for the
   password up front). Running the whole tool under `sudo` also works: the cache
   stays in your own home, and privileges are dropped before `ssh` starts

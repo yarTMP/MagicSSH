@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"magicssh/internal/config"
 	"magicssh/internal/osdetect"
 	"magicssh/internal/scan"
+	"magicssh/internal/sshcheck"
 	"magicssh/internal/tui"
 )
 
@@ -121,16 +123,25 @@ func run(args []string) error {
 		cached = store.Hosts
 	}
 
-	if listMode {
-		return list(opts, store, cached, f.jsonOut)
+	sshPath, sshErr := exec.LookPath("ssh")
+	sudoUser := config.SudoUser()
+	// check runs ssh's known_hosts check for a host, or is nil when it can't
+	// match what ssh will do: without ssh, or under sudo, where the check would
+	// read root's known_hosts while ssh runs as the invoking user.
+	var check func(context.Context, scan.Host) sshcheck.Result
+	if sshErr == nil && sudoUser == nil {
+		check = func(ctx context.Context, h scan.Host) sshcheck.Result {
+			return sshcheck.Check(ctx, sshPath, sshOptions(f, sshExtra, h), h.IP, 2*time.Second)
+		}
 	}
 
-	sshPath, err := exec.LookPath("ssh")
-	if err != nil {
+	if listMode {
+		return list(opts, store, cached, f.jsonOut, check)
+	}
+	if sshErr != nil {
 		return fmt.Errorf("ssh client not found in PATH")
 	}
 
-	sudoUser := config.SudoUser()
 	defUser := f.user
 	if defUser == "" {
 		defUser = os.Getenv("USER")
@@ -138,7 +149,8 @@ func run(args []string) error {
 			defUser = sudoUser.Username
 		}
 	}
-	m := tui.New(opts, store, defUser, cached, store.ScanTime)
+	keys := tui.HostKeys{Check: check, Remove: sshcheck.Remove}
+	m := tui.New(opts, store, defUser, keys, cached, store.ScanTime)
 	final, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	if err != nil {
 		return err
@@ -148,17 +160,7 @@ func run(args []string) error {
 		return nil
 	}
 
-	sshArgs := []string{"ssh", "-l", choice.User}
-	if f.port != 22 {
-		sshArgs = append(sshArgs, "-p", strconv.Itoa(f.port))
-	}
-	if f.identity != "" {
-		sshArgs = append(sshArgs, "-i", f.identity)
-	}
-	if f.keyAlias && choice.Host.MAC != "" {
-		sshArgs = append(sshArgs, "-o", "HostKeyAlias=magicssh-"+strings.ReplaceAll(strings.ToLower(choice.Host.MAC), ":", ""))
-	}
-	sshArgs = append(sshArgs, sshExtra...)
+	sshArgs := append([]string{"ssh", "-l", choice.User}, sshOptions(f, sshExtra, choice.Host)...)
 	// "--" keeps a host value that starts with "-" from being read as an ssh option.
 	sshArgs = append(sshArgs, "--", choice.Host.IP)
 
@@ -176,6 +178,43 @@ func run(args []string) error {
 		}
 	}
 	return syscall.Exec(sshPath, sshArgs, env)
+}
+
+// sshOptions are the options magicssh passes to ssh for h, other than -l and
+// the host. The known_hosts check uses the same ones, so it sees what ssh sees.
+func sshOptions(f cliFlags, extra []string, h scan.Host) []string {
+	var opts []string
+	if f.port != 22 {
+		opts = append(opts, "-p", strconv.Itoa(f.port))
+	}
+	if f.identity != "" {
+		opts = append(opts, "-i", f.identity)
+	}
+	if f.keyAlias && h.MAC != "" {
+		opts = append(opts, "-o", "HostKeyAlias=magicssh-"+strings.ReplaceAll(strings.ToLower(h.MAC), ":", ""))
+	}
+	return append(opts, extra...)
+}
+
+// checkKnownHosts sets KnownHosts on every host with SSH open.
+func checkKnownHosts(hosts []scan.Host, check func(context.Context, scan.Host) sshcheck.Result) {
+	var wg sync.WaitGroup
+	for i := range hosts {
+		hosts[i].KnownHosts = "" // don't keep a status from an earlier run if this check fails
+		if !hosts[i].SSH {
+			continue
+		}
+		wg.Add(1)
+		go func(h *scan.Host) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if r := check(ctx, *h); r.Err == nil {
+				h.KnownHosts = string(r.Status)
+			}
+		}(&hosts[i])
+	}
+	wg.Wait()
 }
 
 // cacheSudo asks for the sudo password now, while the terminal is still ours,
@@ -279,7 +318,8 @@ func scanOptions(f cliFlags, store *config.Store) (scan.Options, error) {
 	return opts, nil
 }
 
-func list(opts scan.Options, store *config.Store, cached []scan.Host, jsonOut bool) error {
+func list(opts scan.Options, store *config.Store, cached []scan.Host, jsonOut bool,
+	check func(context.Context, scan.Host) sshcheck.Result) error {
 	hosts := cached
 	if hosts == nil {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -315,6 +355,14 @@ func list(opts scan.Options, store *config.Store, cached []scan.Host, jsonOut bo
 			}
 		}
 	}
+	if check != nil {
+		checkKnownHosts(hosts, check)
+	} else {
+		// Can't check (no ssh, or under sudo): don't show a cached status.
+		for i := range hosts {
+			hosts[i].KnownHosts = ""
+		}
+	}
 
 	if jsonOut {
 		if hosts == nil {
@@ -333,6 +381,7 @@ func list(opts scan.Options, store *config.Store, cached []scan.Host, jsonOut bo
 		return nil
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	mismatches := 0
 	fmt.Fprintln(tw, "#\tOS\tCONF\tIP\tHOSTNAME\tVENDOR\tSSH\tLATENCY")
 	for i, h := range hosts {
 		name := h.Hostname
@@ -345,14 +394,26 @@ func list(opts scan.Options, store *config.Store, cached []scan.Host, jsonOut bo
 			if ssh == "" {
 				ssh = "open"
 			}
-			if h.KeyChanged {
+			switch {
+			case h.KnownHosts == "revoked":
+				ssh = "✖ REVOKED KEY " + ssh
+			case h.KnownHosts == "mismatch":
+				ssh = "⚠ KNOWN_HOSTS MISMATCH " + ssh
+				mismatches++
+			case h.KeyChanged:
 				ssh = "⚠ KEY CHANGED " + ssh
 			}
 		}
 		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", i+1, h.OS.Label(), h.OS.Confidence,
 			h.IP, dash(name), dash(clip(h.Vendor, 20)), ssh, scan.FormatLatency(h.Latency))
 	}
-	return tw.Flush()
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if mismatches > 0 {
+		fmt.Fprintf(os.Stderr, "\n%d host(s) don't match your known_hosts, so ssh would refuse them. Run magicssh and select one for details.\n", mismatches)
+	}
+	return nil
 }
 
 func clip(s string, n int) string {

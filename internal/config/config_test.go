@@ -41,19 +41,19 @@ func TestCheckHostKeys(t *testing.T) {
 	h := scan.Host{IP: "192.168.1.5", MAC: "aa:bb:cc:dd:ee:ff", SSH: true, HostKey: "ssh-ed25519 SHA256:one"}
 	hosts := []scan.Host{h}
 	s.CheckHostKeys(hosts)
-	if hosts[0].KeyChanged || s.KnownHostKey(h) != h.HostKey {
+	if hosts[0].KeyChanged || s.KnownHostKey(h).Key != h.HostKey {
 		t.Fatal("first sighting should be remembered, not flagged")
 	}
 
 	h.HostKey = "ssh-ed25519 SHA256:two"
 	hosts = []scan.Host{h}
 	s.CheckHostKeys(hosts)
-	if !hosts[0].KeyChanged || s.KnownHostKey(h) != "ssh-ed25519 SHA256:one" {
+	if !hosts[0].KeyChanged || s.KnownHostKey(h).Key != "ssh-ed25519 SHA256:one" {
 		t.Fatal("a different key must be flagged and not stored")
 	}
 
 	s.TrustHostKey(&hosts[0])
-	if hosts[0].KeyChanged || s.KnownHostKey(h) != "ssh-ed25519 SHA256:two" {
+	if hosts[0].KeyChanged || s.KnownHostKey(h).Key != "ssh-ed25519 SHA256:two" {
 		t.Fatal("TrustHostKey should accept the new key")
 	}
 }
@@ -103,5 +103,34 @@ func TestConcurrentSaves(t *testing.T) {
 	left, _ := filepath.Glob(filepath.Join(filepath.Dir(s.path), "*.tmp"))
 	if len(left) != 0 {
 		t.Errorf("temp files left behind: %v", left)
+	}
+}
+
+func TestSeenKeyOldFormat(t *testing.T) {
+	s := load(t)
+	old := `{"host_keys": {"mac:aa:bb:cc:dd:ee:ff": "ssh-ed25519 SHA256:one"}}`
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := s.KnownHostKey(scan.Host{MAC: "aa:bb:cc:dd:ee:ff"})
+	if k.Key != "ssh-ed25519 SHA256:one" || !k.Since.IsZero() {
+		t.Errorf("old format read as %+v", k)
+	}
+	// New keys record when they were first seen, and survive a save.
+	hosts := []scan.Host{{IP: "10.0.0.2", MAC: "11:22:33:44:55:66", HostKey: "ssh-ed25519 SHA256:two"}}
+	s.CheckHostKeys(hosts)
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	s, _ = Load()
+	if k := s.KnownHostKey(hosts[0]); k.Key != "ssh-ed25519 SHA256:two" || k.Since.IsZero() {
+		t.Errorf("new key read back as %+v", k)
 	}
 }

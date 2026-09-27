@@ -18,11 +18,11 @@ import (
 )
 
 type Store struct {
-	Subnet   string            `json:"subnet,omitempty"`
-	ScanTime time.Time         `json:"scan_time,omitempty"`
-	Hosts    []scan.Host       `json:"hosts,omitempty"`
-	Users    map[string]string `json:"users,omitempty"`     // device ID (see deviceID) -> username
-	HostKeys map[string]string `json:"host_keys,omitempty"` // device ID -> SSH host key fingerprint
+	Subnet   string             `json:"subnet,omitempty"`
+	ScanTime time.Time          `json:"scan_time,omitempty"`
+	Hosts    []scan.Host        `json:"hosts,omitempty"`
+	Users    map[string]string  `json:"users,omitempty"`     // device ID (see deviceID) -> username
+	HostKeys map[string]SeenKey `json:"host_keys,omitempty"` // device ID -> SSH host key
 
 	path     string
 	uid, gid int // owner to give saved files; -1 keeps the current one
@@ -73,7 +73,7 @@ func Load() (*Store, error) {
 			s.Users = map[string]string{}
 		}
 		if s.HostKeys == nil {
-			s.HostKeys = map[string]string{}
+			s.HostKeys = map[string]SeenKey{}
 		}
 	}()
 	data, err := os.ReadFile(p)
@@ -97,8 +97,9 @@ func Load() (*Store, error) {
 	for k, u := range s.Users {
 		s.Users[k] = scan.Clean(u, 64)
 	}
-	for k, fp := range s.HostKeys {
-		s.HostKeys[k] = scan.Clean(fp, 128)
+	for k, sk := range s.HostKeys {
+		sk.Key = scan.Clean(sk.Key, 128)
+		s.HostKeys[k] = sk
 	}
 	return s, nil
 }
@@ -178,9 +179,9 @@ func (s *Store) CheckHostKeys(hosts []scan.Host) {
 			continue
 		}
 		switch known := s.HostKeys[deviceID(*h)]; {
-		case known == "":
-			s.HostKeys[deviceID(*h)] = h.HostKey
-		case known != h.HostKey:
+		case known.Key == "":
+			s.HostKeys[deviceID(*h)] = SeenKey{Key: h.HostKey, Since: time.Now()}
+		case known.Key != h.HostKey:
 			h.KeyChanged = true
 		}
 	}
@@ -189,12 +190,30 @@ func (s *Store) CheckHostKeys(hosts []scan.Host) {
 // TrustHostKey accepts h's current host key, e.g. after the user confirmed a change.
 func (s *Store) TrustHostKey(h *scan.Host) {
 	if h.HostKey != "" {
-		s.HostKeys[deviceID(*h)] = h.HostKey
+		s.HostKeys[deviceID(*h)] = SeenKey{Key: h.HostKey, Since: time.Now()}
 		h.KeyChanged = false
 	}
 }
 
 // KnownHostKey returns the host key remembered for h's device, if any.
-func (s *Store) KnownHostKey(h scan.Host) string {
+func (s *Store) KnownHostKey(h scan.Host) SeenKey {
 	return s.HostKeys[deviceID(h)]
+}
+
+// SeenKey is a device's SSH host key and since when magicssh has seen it.
+type SeenKey struct {
+	Key   string    `json:"key"` // "<type> SHA256:<fingerprint>"
+	Since time.Time `json:"since,omitzero"`
+}
+
+// UnmarshalJSON also reads the older format, a bare fingerprint string, whose
+// first-seen time is unknown.
+func (k *SeenKey) UnmarshalJSON(data []byte) error {
+	var fp string
+	if json.Unmarshal(data, &fp) == nil {
+		*k = SeenKey{Key: fp}
+		return nil
+	}
+	type plain SeenKey
+	return json.Unmarshal(data, (*plain)(k))
 }

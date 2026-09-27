@@ -14,13 +14,18 @@ import (
 
 func newTestModel(t *testing.T, hosts ...scan.Host) *Model {
 	t.Helper()
+	return newTestModelKeys(t, HostKeys{}, hosts...)
+}
+
+func newTestModelKeys(t *testing.T, keys HostKeys, hosts ...scan.Host) *Model {
+	t.Helper()
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	store, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	sn, _ := scan.ParseSubnet("192.168.1.0/24")
-	return New(scan.Options{Subnet: sn, Port: 22}, store, "me", hosts, time.Now())
+	return New(scan.Options{Subnet: sn, Port: 22}, store, "me", keys, hosts, time.Now())
 }
 
 func key(s string) tea.KeyMsg {
@@ -94,7 +99,7 @@ func TestRecheckDoesNotStealFilterInput(t *testing.T) {
 func TestChangedHostKeyNeedsConfirmation(t *testing.T) {
 	h := scan.Host{IP: "192.168.1.5", MAC: "aa:bb:cc:dd:ee:ff", SSH: true, HostKey: "ssh-ed25519 SHA256:new"}
 	m := newTestModel(t)
-	m.store.HostKeys["mac:aa:bb:cc:dd:ee:ff"] = "ssh-ed25519 SHA256:old"
+	m.store.HostKeys["mac:aa:bb:cc:dd:ee:ff"] = config.SeenKey{Key: "ssh-ed25519 SHA256:old"}
 	m.startScan()
 	m.cancel()
 	m.Update(doneMsg{hosts: []scan.Host{h}})
@@ -117,7 +122,7 @@ func TestChangedHostKeyNeedsConfirmation(t *testing.T) {
 		t.Fatalf("second enter: mode %d, want user prompt", m.mode)
 	}
 	m.Update(key("enter"))
-	if m.Choice == nil || m.store.KnownHostKey(h) != h.HostKey {
+	if m.Choice == nil || m.store.KnownHostKey(h).Key != h.HostKey {
 		t.Errorf("connecting should trust the new key; known = %q", m.store.KnownHostKey(h))
 	}
 }

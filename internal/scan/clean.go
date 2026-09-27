@@ -49,6 +49,11 @@ func (h *Host) Sanitize() bool {
 	h.Hostname = Clean(h.Hostname, maxHostnameLen)
 	h.Banner = Clean(h.Banner, maxBannerLen)
 	h.HostKey = Clean(h.HostKey, 128)
+	switch h.KnownHosts {
+	case "", "ok", "unknown", "mismatch", "revoked":
+	default:
+		h.KnownHosts = ""
+	}
 	h.Vendor = Clean(h.Vendor, 64)
 	h.OS.OS = osdetect.OS(Clean(string(h.OS.OS), 32))
 	h.OS.Detail = Clean(h.OS.Detail, 64)

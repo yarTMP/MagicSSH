@@ -33,7 +33,11 @@ type Host struct {
 	HostKey  string `json:"host_key,omitempty"` // "<type> SHA256:<fingerprint>"
 	// KeyChanged is set when HostKey differs from the key remembered for this
 	// device: it may be a different machine answering on its address.
-	KeyChanged bool            `json:"key_changed,omitempty"`
+	KeyChanged bool `json:"key_changed,omitempty"`
+	// KnownHosts is the result of checking the host key against the user's
+	// known_hosts as ssh would: "ok", "unknown", "mismatch" or "revoked"
+	// ("" = not checked). See package sshcheck.
+	KnownHosts string          `json:"known_hosts,omitempty"`
 	Latency    time.Duration   `json:"latency"`
 	TTL        int             `json:"ttl,omitempty"`
 	OpenPorts  []int           `json:"open_ports,omitempty"`

@@ -16,6 +16,7 @@ import (
 	"magicssh/internal/config"
 	"magicssh/internal/osdetect"
 	"magicssh/internal/scan"
+	"magicssh/internal/sshcheck"
 )
 
 // Selection is what the user picked; nil Host means they quit.
@@ -31,6 +32,7 @@ const (
 	modeList
 	modeFilter
 	modeUser
+	modeHostKey // explaining a known_hosts mismatch
 )
 
 type (
@@ -49,6 +51,8 @@ type Model struct {
 	opts        scan.Options
 	store       *config.Store
 	defaultUser string
+	keys        HostKeys
+	started     time.Time // keys first seen before this are "history"
 
 	mode     mode
 	hosts    []scan.Host
@@ -72,7 +76,10 @@ type Model struct {
 	connect   bool      // user prompt was opened by Enter (connect) rather than 'u'
 	target    scan.Host // host the user prompt applies to
 	confirmIP string    // host whose changed key was shown; enter again connects
-	sshOnly   bool      // hide devices without the SSH port open
+	keyRes    sshcheck.Result
+	keyInput  textinput.Model // "yes" to remove stale known_hosts entries
+	removing  bool            // ssh-keygen -R is running
+	sshOnly   bool            // hide devices without the SSH port open
 
 	width, height int
 
@@ -80,8 +87,8 @@ type Model struct {
 }
 
 // New creates the picker. If cached is non-empty the list is shown immediately
-// instead of starting a scan.
-func New(opts scan.Options, store *config.Store, defaultUser string, cached []scan.Host, scannedAt time.Time) *Model {
+// instead of starting a scan. keys checks hosts against known_hosts.
+func New(opts scan.Options, store *config.Store, defaultUser string, keys HostKeys, cached []scan.Host, scannedAt time.Time) *Model {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(accent)
@@ -94,9 +101,14 @@ func New(opts scan.Options, store *config.Store, defaultUser string, cached []sc
 	ui.Prompt = "user: "
 	ui.CharLimit = 64
 
+	ki := textinput.New()
+	ki.Prompt = "remove old entries? "
+	ki.Placeholder = "yes"
+	ki.CharLimit = 3
+
 	// The scan always keeps every device; SSH-only is a view toggle ('s').
-	m := &Model{opts: opts, store: store, defaultUser: defaultUser, sshOnly: opts.SSHOnly,
-		spin: sp, filter: fi, userInput: ui, width: 100, height: 24}
+	m := &Model{opts: opts, store: store, defaultUser: defaultUser, keys: keys, started: time.Now(),
+		sshOnly: opts.SSHOnly, spin: sp, filter: fi, userInput: ui, keyInput: ki, width: 100, height: 24}
 	m.opts.SSHOnly = false
 	if len(cached) > 0 {
 		m.hosts, m.scanned, m.mode = cached, scannedAt, modeList
@@ -110,7 +122,7 @@ func (m *Model) Init() tea.Cmd {
 	if m.mode == modeScanning {
 		return tea.Batch(m.spin.Tick, m.startScan())
 	}
-	return nil
+	return m.checkAll() // cached results: known_hosts may have changed since
 }
 
 func (m *Model) startScan() tea.Cmd {
@@ -176,7 +188,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.saveCache()
 		m.hostsChanged()
+		return m, m.checkAll()
+
+	case knownHostsMsg:
+		m.applyKnownHosts(msg)
 		return m, nil
+
+	case preconnectMsg:
+		return m, m.handlePreconnect(msg)
+
+	case removedMsg:
+		return m, m.handleRemoved(msg)
 
 	case recheckMsg:
 		// A rescan started since the recheck began: its results replace this one.
@@ -209,7 +231,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// The user is typing a filter or a username; don't steal the input.
 			return m, nil
 		}
-		return m, m.connectTo(h)
+		return m, m.checkThenConnect(h)
 
 	case tea.KeyMsg:
 		m.warn = ""
@@ -232,6 +254,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateFilter(msg)
 		case modeUser:
 			return m.updateUser(msg)
+		case modeHostKey:
+			return m.updateHostKey(msg)
 		case modeList:
 			return m.updateList(msg)
 		}
@@ -280,7 +304,7 @@ func (m *Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if h.SSH {
-			return m, m.connectTo(h)
+			return m, m.checkThenConnect(h)
 		}
 		// SSH was closed at scan time; check again in case it was enabled since.
 		m.status = fmt.Sprintf("checking SSH on %s…", h.IP)
@@ -299,7 +323,7 @@ func (m *Model) connectTo(h scan.Host) tea.Cmd {
 	if h.KeyChanged && m.confirmIP != h.IP {
 		m.confirmIP = h.IP
 		m.warn = fmt.Sprintf("⚠ %s presents a different SSH host key (was %s, now %s). It may be another machine. Press enter again to connect anyway.",
-			h.IP, m.store.KnownHostKey(h), h.HostKey)
+			h.IP, m.store.KnownHostKey(h).Key, h.HostKey)
 		return nil
 	}
 	m.confirmIP = ""
@@ -552,6 +576,14 @@ func (m *Model) View() string {
 		return b.String()
 	}
 
+	if m.mode == modeHostKey {
+		b.WriteString(m.viewHostKey())
+		if m.warn != "" {
+			b.WriteString(warnSt.Render(truncate(m.warn, m.width-1)) + "\n")
+		}
+		return b.String()
+	}
+
 	if m.err != nil {
 		b.WriteString(errSt.Render("scan failed: "+m.err.Error()) + "\n\n")
 		b.WriteString(help("r", "rescan", "q", "quit"))
@@ -659,6 +691,10 @@ var columns = []column{
 		switch {
 		case !h.SSH:
 			return "–"
+		case h.KnownHosts == "revoked":
+			return "✖ revoked key " + osdetect.BannerSoftware(h.Banner)
+		case h.KnownHosts == "mismatch":
+			return "⚠ known_hosts " + osdetect.BannerSoftware(h.Banner)
 		case h.KeyChanged:
 			return "⚠ key changed " + osdetect.BannerSoftware(h.Banner)
 		case h.Banner == "":
@@ -794,4 +830,9 @@ func truncate(s string, w int) string {
 		return "…"
 	}
 	return string(r[:w-1]) + "…"
+}
+
+// lipglossWrap word-wraps s to width w, indented by two spaces.
+func lipglossWrap(s string, w int) string {
+	return lipgloss.NewStyle().PaddingLeft(2).Width(max(w, 30)).Render(s)
 }
