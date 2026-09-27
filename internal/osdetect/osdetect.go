@@ -107,7 +107,8 @@ func (s *score) add(os OS, weight int, reason string) {
 // Classify combines all signals into a best guess.
 func Classify(sig Signals) Result {
 	s := &score{votes: map[OS]int{}, detail: map[OS]string{}, reasons: map[OS][]string{}}
-	unixLike := 0 // evidence for "Linux or macOS" without telling them apart
+	unixLike := 0        // evidence for "Linux or macOS" without telling them apart
+	macSpecific := false // evidence for macOS itself, not just Apple hardware
 
 	// nmap, when available, is the strongest signal.
 	if n := strings.ToLower(sig.NmapOS); n != "" {
@@ -116,6 +117,7 @@ func Classify(sig Signals) Result {
 			s.add(Windows, 10, "nmap: "+sig.NmapOS)
 		case strings.Contains(n, "mac os") || strings.Contains(n, "macos") || strings.Contains(n, "darwin") || strings.Contains(n, "os x"):
 			s.add(MacOS, 10, "nmap: "+sig.NmapOS)
+			macSpecific = true
 		case strings.Contains(n, "linux"):
 			s.add(Linux, 10, "nmap: "+sig.NmapOS)
 		case strings.Contains(n, "bsd"):
@@ -162,6 +164,8 @@ func Classify(sig Signals) Result {
 	// NIC vendor.
 	switch v := strings.ToLower(sig.Vendor); {
 	case strings.HasPrefix(v, "apple"):
+		// Apple hardware, which may just as well run Linux (e.g. Omarchy on a
+		// MacBook). Capped below unless something points at macOS itself.
 		s.add(MacOS, 6, "Apple network adapter")
 	case strings.HasPrefix(v, "microsoft"):
 		s.add(Windows, 4, "Microsoft/Hyper-V network adapter")
@@ -184,6 +188,7 @@ func Classify(sig Signals) Result {
 	case containsAny(h, "macbook", "imac", "mac-mini", "macmini", "mac-studio", "mbp", "mba-", "-mac."):
 		s.add(MacOS, 4, "Mac-style hostname")
 		macHostname = true
+		macSpecific = true
 	case containsAny(h, "iphone", "ipad"):
 		// Outvotes the Apple NIC, which iPhones share with Macs.
 		s.add(IOS, 8, "iPhone/iPad hostname")
@@ -206,9 +211,11 @@ func Classify(sig Signals) Result {
 	}
 	if ports[548] || ports[3283] {
 		s.add(MacOS, 5, "AFP/Remote Desktop (548/3283) open")
+		macSpecific = true
 	}
 	if ports[88] && ports[445] && !ports[135] {
 		s.add(MacOS, 3, "Kerberos + SMB without MSRPC (macOS file sharing)")
+		macSpecific = true
 	}
 
 	// TTL: Windows starts at 128, Linux/macOS at 64.
@@ -260,7 +267,20 @@ func Classify(sig Signals) Result {
 	case bestVotes >= 5:
 		conf = Medium
 	}
-	return Result{OS: best, Detail: s.detail[best], Confidence: conf, Reasons: s.reasons[best]}
+	reasons := s.reasons[best]
+	if best == MacOS && !macSpecific {
+		// Only the Apple NIC says "Mac", and that is hardware, not the OS.
+		if sw != "" {
+			// A plain OpenSSH banner fits Linux as well, and Linux boxes run
+			// sshd far more often than Macs have Remote Login on.
+			s.detail[MacOS] = "or Linux"
+			conf = Low
+			reasons = append(reasons, "plain OpenSSH banner fits Linux on Apple hardware too")
+		} else {
+			conf = min(conf, Medium)
+		}
+	}
+	return Result{OS: best, Detail: s.detail[best], Confidence: conf, Reasons: reasons}
 }
 
 func containsAny(s string, subs ...string) bool {

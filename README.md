@@ -92,7 +92,7 @@ No root needed for the default path. Each signal adds weighted votes:
 | SSH banner | `OpenSSH_for_Windows_9.5` | Windows (strong) |
 | SSH banner | `… Ubuntu-3ubuntu13.5`, `Debian`, `Raspbian` | Linux + distro (strong) |
 | SSH banner | `dropbear`, `FreeBSD` | embedded Linux, BSD |
-| NIC vendor (OUI) | Apple / Microsoft / Raspberry Pi | macOS / Windows / Linux |
+| NIC vendor (OUI) | Apple / Microsoft / Raspberry Pi | Mac hardware (macOS or Linux) / Windows / Linux |
 | Extra open ports | 135 (MSRPC), 3389 (RDP) | Windows |
 | Extra open ports | 548 (AFP), 3283 (ARD), 88+445 without 135 | macOS |
 | ICMP TTL | ~128 vs ~64 | Windows vs Unix-like |
@@ -108,6 +108,10 @@ No root needed for the default path. Each signal adds weighted votes:
 - **macOS vs. Linux** is the hard case. macOS, Arch, Fedora and RHEL all send a
   plain `OpenSSH_X.Y` banner. Without an Apple MAC, Mac-style hostname or Mac
   ports, such hosts show as `Linux (or macOS)` with low confidence.
+- An **Apple MAC means Apple hardware, not macOS**: Macs often run Linux (e.g.
+  Omarchy on a MacBook). With only an Apple NIC and a plain OpenSSH banner a
+  host shows as `macOS (or Linux)` with low confidence; a Mac-style hostname,
+  Mac ports or `--deep` settle it.
 - Newer phones and laptops often use **private (randomized) MACs**, which hide
   the vendor.
 - Windows Firewall usually blocks ping, so TTL is often missing for Windows.
